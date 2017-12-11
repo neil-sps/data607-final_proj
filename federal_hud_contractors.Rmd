@@ -1,0 +1,182 @@
+---
+title: "Applying Bi-Partite Stochastic Model to Federal HUD Contractors"
+author: "N.Hwang"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    #cayman tactile architect
+    highlight: github
+---
+
+# Introduction
+
+In the 2018 fiscal year that started this past October, the US Federal government will spend a total of $4.1 trillion . With the revenue of $3.65 trillion, the government would add about $450 billion of deficit to its balance sheet. While the growing debt on the government's books is no news, there is a general consensus that such a large debt on the economy is a burden, not only on our current economy, but more so on future generations who would be liable to service the debt in the years to come. A big chunk of this spending goes to private contractors. For instance, more than 80% of the Federal government's IT spending is for contractors, and 90%+ for the Department of Energy.
+
+There is potential for applying the stochastic network model to study government expenditures on private contractors in order to identify latent patterns in government purchasing. The market for government contracts is attractive for studies like this for a plethora of reasons. One is that since the market has only one customer (i.e., monopsony), the government, the market can be represented as a bipartite network comprised of contractors and services. This is appealing since bipartite networks are computationally easier to study at scale. Another reason for the appeal is the readily available data sources. The government is required to make available the sources and uses of funds, specifying the government agencies, vendors, dates, and award amounts for various services. Last, but not least, is the notion that such a study serves the public good and hence a potential for policy implications.
+
+In this project, I proceed as follows:
+
+1) Data source: I pull the federal spending data from www.usaspending.gov for the Department of Housing and Urban Development for the year 2017. For each of the contract, I checked to see if they were also awarded in the previous 6 years going back to 2010 to gauge how `common` those contracts were. In general, I tried to avoid `one-off` type contracts, and focus on more regularly-awarded contracts. 
+
+2) Data manipulation and preparation for analysis: Then, I condense the dataset through to obtain columns of vendors, categories of products and services sold to the government, and the gross contract amounts. Each contractor is identified by a federal government vendor code.I group individual contracts by vendor code, and subset the dataset to only those contracts above a certain threshold dollar amount. As the final step in the data manipulation phase, I use the `pandas` package in R to convert the dataset into an edgelist comprised of all the edges between contractors and products so that the network analysis algorithm (discussed below) can work with it. Then I use the `igraph` package in R to convert this into an adjacency matrix in a form that can be understood by Matlab in the visualization step below.
+
+3) Dimensionality Reduction: In the next step, I use "the minimum description length" algorithm (see for reference https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.110.148701), to identify the optimal number of nodes for vendors and products, and hence condense the dimensionality of the network. The core algorithm is implemented in C++ for speed, and I use a wrapper in R to execute the algorithm on the edgelist constructed above.
+
+4) Network Analysis: I use the Bipartite Stochastic Block Model (BiSBM) (see for reference http://danlarremore.com/pdf/2014_LCJ_EfficientlyInferringCommunityStructureInBipartiteNetworks_PRE.pdf) to identify clusters for each vendor and product such that the total number of such clusters equals that identified in the dimensionality reduction step above. The core algorithm is implemented in C++ for efficiency, with a wrapper function in R. The output from the BiSBM would be a data frame consisting of four columns. vendors, clulster IDs for the vendors, products, and Cluster IDs for products. 
+
+5) Visualization: With the above data, I use the D3 library in Javascript and the webweb wrapper package for Matlab (see http://danlarremore.com/webweb/) to create visualizations of the bipartitate network for further exploratory analysis and infer conclusions not obtained in the previous step. 
+
+6) Conclusions and next steps: I hope to draw several useful policy implications for both policymakers and the general audience, and suggestions for further studies. 
+
+
+# Methodology
+## Data Source
+Data was downloaded from `www.usaspending.gov` for 2017 Federal government contracts for HUD in the `Rda` format, and earlier data from 2010 to 2016 were downloaded in the `CSV` format. 
+
+## Package and directory setup for biSBM
+
+After downloading 2017 Federal contractor data, I apply a series of data manipulation and tidying steps to get the data set ready for analysis. First, I complete some housekeeping tasks.
+
+```{r, message=FALSE, warning=FALSE}
+library(plyr)
+library(stringr)
+library("rio")
+library(tidyverse)
+library(Rcpp)
+library(devtools)
+library(rvest)
+
+# First, set the working directory to biSBM folder
+# Then, run he following commands
+curwd <- getwd()
+load(str_replace_all(paste(curwd, "/firm_product_data.Rda"), " ", ""))
+data <- firms_products
+```
+
+Then, to focus on those products and services that are purchased at least a several times by the Government, I remove all products not commonly purchased at least 20 times in the previous 6 years. 
+
+```{r}
+# Remove all products that aren't purchased at least 20 times
+filtered <- data %>% filter(purchases >= 20)
+```
+
+
+## Data Preparation: Generate "edgelist"" and "types"" data files
+
+In order to implement the bi-partite stochastmic block model (i.e., `biSBM`), we need to find two inputs from the raw dataset, namely: 
+(1) `edgelist` - a list of edges between firm nodes and product nodes, where nodes are re-indexed using natural numbers (i.e., 1-indexed);
+
+(2) `types` - list of all nodes and a binary code for type: 1 for firm and 2 for product.
+
+Below `R` code generates the two files from the raw input.
+
+```{r}
+# Generate the nodeTypes file
+firms <- rep(1, length(unique(filtered$cnpj)))  #type for firms
+products <- rep(2, length(unique(filtered$id_item))) #type for products
+write(c(firms, products), file = "firm_product_data.types", sep='\n') #write types file
+
+# Generate the edges file by indexing the nodes and creating a dictionary
+firms_dict <- filtered %>% select(cnpj) %>% distinct() %>% arrange(cnpj) %>% bind_rows()
+no_cnpj <- length(unique(filtered$cnpj))
+firms_dict$conversion <- seq(1:no_cnpj)
+
+products_dict <- filtered %>% select(id_item) %>% distinct() %>% arrange(id_item) %>% bind_rows()
+no_prod <- length(unique(filtered$id_item))
+products_dict$conversion <- seq(from = no_cnpj+1, to=no_cnpj+no_prod)
+
+renamed <- filtered %>% transmute(cnpj = plyr::mapvalues(cnpj, firms_dict$cnpj, firms_dict$conversion),
+              id_item = plyr::mapvalues(id_item, products_dict$id_item, products_dict$conversion)) %>% 
+              mutate_if(is.character, as.numeric)
+
+edgelist <- renamed
+
+write.table(edgelist, file = "firm_product_data.edgelist", sep='\t', col.names = F, row.names = F)
+```
+
+
+## Dimensionality Reduction
+
+First, we determine the optimal size of the communities for the firms and products using the `minimum description length` principle or `MDL` as discussed in the paper [Parsimonious Module Inference in Large Networks](https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.110.148701) and implemented in the Python package [bipartiteSBM MCMC algorithm](http://https://github.com/junipertcy/bipartiteSBM-MCMC). 
+
+The `MDL` algorithm returns the optimal community sizes for firms and products, subject to the `resolution limit` of $\frac{\sqrt(|edges|)}{2}$ or about 87, with 30,000 edges, as is the case in our current dataset. The `MDL` solution in our case is `(10,11)` or 10 communities for firms and 11 for products. 
+
+Then, we identify the community structure using the above `MDL` solution for firms and products. We partition the network of firms and products such that the number of groups of firms and products are as dictated by the `MDL` solution. 
+
+## MDL Code 
+Below is the `python` code snippet used to get this result (see enclosed python file for full implementation details):
+
+```python
+mcmc = MCMC(f_engine="engines/bipartiteSBM-MCMC/bin/mcmc",  # path to the graph partitioning binary
+            n_sweeps=10,                                    # number of partitioning computations for each (K1, K2) data point
+            is_parallel=True,                               # whether to compute the partitioning in parallel
+            n_cores=2,                                      # if `is_parallel == True`, the number of cores used   
+            mcmc_steps=10000000,#100000,                              # [MCMC] the number of sweeps
+            mcmc_await_steps=1000000,                         # [MCMC] the number of sweeps to await until stopping the algorithm, if max(entropy) and min(entropy) show no change therein  
+            mcmc_cooling="constant",                     # [MCMC] annealing scheme used. enum: ["exponential", "logarithm", "linear", "constant"].
+            mcmc_cooling_param_1=0.1,                        # [MCMC] parameter 1 for the annealing
+            mcmc_cooling_param_2=0.1,                       # [MCMC] parameter 2 for the annealing
+            mcmc_epsilon=10   #0.01                            # [MCMC] the "epsilon" value used in the algorithm
+        )
+    edgelist = get_edgelist("dataset/empirical/firm_product_data_short.edgelist", "\t")
+    types = get_types("dataset/empirical/firm_product_data.types")
+    oks = OptimalKs(mcmc, edgelist, types)
+    oks.set_params(init_ka=math.sqrt(30500)/2, init_kb=math.sqrt(30500)/2, i_th=.1)
+
+    #oks.clean()
+    oks.iterator()  
+}
+```
+
+## Run the biSBM function
+Please see above for discussion on the choices for `ka` and `kb`.
+In the call to `biSBM` function, the parameter `deg.corr=1` dictates `biSBM` to use correction for observed degree sequence before finding community, rather than simply bundling commnities with Poisson degree distributions. 
+
+To run the biSBM code, uncomment the 2 lines of code, starting with the function call below. It takes about 4 hours to run using a dual-core processor with 4GB of RAM.
+
+```{r}
+# Load and compile biSBM.R file. This creates the C++ object linker file
+source("biSBM.R");
+
+edges <- read.table("firm_product_data.edgelist");  ## edgelist
+types <- read.table("firm_product_data.types");     ## nodeType
+
+# call to the function: by default deg.corr=1 and iter = 10.
+# Uncomment below 2 lines of code to run. 
+# g_10_11_3 <- biSBM(data = edges, nodeType = types, ka = 10, kb = 11, deg.corr = 1, iter = 3)
+# write(g_10_11_3, "g_10_11_3.csv", sep=",")
+```
+
+## Combine cluster results to the firms and product nodes in original file
+This returns two data frames, one for firms and the other for products, with their cluster assignments. The final output of the analysis below is the assignment of each contractor to one of 10 communities and the contract jobs to one of 11 communities. Given the sheer number of all the contractors and jobs, I show the first 10 assignments in each group. 
+
+```{r}
+csv_file <- str_replace_all(paste(curwd, "/g_10_11_3.csv"), " ", "")
+cluster <- as.vector(t(as.matrix(read.csv(csv_file, header=FALSE))))
+temp_firms <- data.frame(id=seq(1:no_cnpj), type=firms, cluster=cluster[1:no_cnpj])
+temp_firms <- temp_firms %>% 
+                add_column(cnpj = plyr::mapvalues(temp_firms$id, firms_dict$conversion, 
+                                                  firms_dict$cnpj))
+temp_prod  <- data.frame(id=seq(from=(no_cnpj+1), to=(no_cnpj+no_prod), by=1), type=products, 
+                         cluster=cluster[(no_cnpj+1):(no_cnpj+no_prod)])
+temp_prod  <- temp_prod %>% 
+  add_column(id_item = plyr::mapvalues(temp_prod$id, products_dict$conversion, products_dict$id_item))
+
+firm_clusters <- temp_firms %>% select(cnpj, cluster)
+product_clusters <- temp_prod %>% select(id_item, cluster)
+
+# First few firms and their clusters
+knitr::kable(head(firm_clusters, 10))
+
+# First few products and their clusters
+knitr::kable(head(product_clusters, 10))
+```
+
+## Visualization
+
+The visualization below was created using the `webweb` D3 library, as mentioned above, and shows a number of interesting observations. For one, as can be seen below, there are three contractors that have the most number of contracts, all of whom coincidentally have the same number of contracts but all have different types of projects. 
+
+A second observation is that while there are three most active contractors, the other contractors seem just as active. In other words, all the contractors seem about the same in terms of the number of contracts they are working on. Lastly, the contractors seem to be highly interconnected, meaning, the prolific contractors appear to be only two or three degrees away from other contractors in terms of the projects they are working on. 
+
+![Visualization of the Contractors and Products](/home/neil/graph.PNG)
